@@ -2,7 +2,7 @@ use super::CustomDebugInfo;
 use darling::ast;
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{GenericParam, Generics, Meta, MetaNameValue};
+use syn::{parse_quote, GenericParam, Meta, MetaNameValue};
 
 fn extract_debug_attribute_value<'a>(
     attrs: &mut impl Iterator<Item = &'a syn::Attribute>,
@@ -13,41 +13,54 @@ fn extract_debug_attribute_value<'a>(
     })
 }
 
-fn extract_type_arguments(ty: &syn::Type) -> Vec<String> {
-    match ty {
-        syn::Type::Path(type_path) => type_path
-            .path
-            .segments
-            .iter()
-            .flat_map(|segment| match &segment.arguments {
-                syn::PathArguments::AngleBracketed(args) => args
-                    .args
-                    .iter()
-                    .filter_map(|arg| {
-                        if let syn::GenericArgument::Type(syn::Type::Path(param_path)) = arg {
-                            param_path
-                                .path
-                                .segments
-                                .last()
-                                .map(|seg| seg.ident.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-                _ => vec![],
-            })
-            .collect(),
-
-        _ => vec![],
+fn extract_type_name(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(syn::TypePath {
+        path: syn::Path { ref segments, .. },
+        ..
+    }) = ty
+    {
+        if let Some(syn::PathSegment { ref ident, .. }) = segments.last() {
+            return Some(ident.to_string());
+        }
     }
+    return None;
+}
+
+fn extract_phantom_generic_type_name(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(syn::TypePath {
+        path: syn::Path { ref segments, .. },
+        ..
+    }) = ty
+    {
+        if let Some(syn::PathSegment {
+            ref ident,
+            ref arguments,
+        }) = segments.last()
+        {
+            if ident == "PhantomData" {
+                if let syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
+                    args,
+                    ..
+                }) = arguments
+                {
+                    if let Some(syn::GenericArgument::Type(syn::Type::Path(ref gp))) = args.first()
+                    {
+                        if let Some(generic_ident) = gp.path.segments.first() {
+                            return Some(generic_ident.ident.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return None;
 }
 
 pub(crate) fn process(info: CustomDebugInfo) -> TokenStream {
     let CustomDebugInfo {
         ident: name,
         data: ast::Data::Struct(fields),
-        generics,
+        mut generics,
     } = info
     else {
         return syn::Error::new(
@@ -57,49 +70,45 @@ pub(crate) fn process(info: CustomDebugInfo) -> TokenStream {
         .to_compile_error();
     };
 
+    let mut phantom_types = vec![];
+    let mut field_type_names = vec![];
     let fields_chain = fields.iter().map(|field| {
         let field_name = &field.ident;
+
+        if let Some(phantom_type_name) = extract_phantom_generic_type_name(&field.ty) {
+            phantom_types.push(phantom_type_name);
+        }
+
+        if let Some(field_type_name) = extract_type_name(&field.ty) {
+            field_type_names.push(field_type_name);
+        }
+
         let debug_format = extract_debug_attribute_value(&mut field.attrs.iter());
         if let Some(debug_format) = debug_format {
             quote! {.field(stringify!(#field_name), &format_args!(#debug_format,&self.#field_name))}
         } else {
             quote! {.field(stringify!(#field_name), &self.#field_name)}
         }
-    });
+    }).collect::<Vec<_>>();
 
-    let Generics { params, .. } = &generics;
+    println!("{:?}", phantom_types);
+    println!("{:?}", field_type_names);
 
-    let bound = if params.is_empty() {
-        quote! {}
-    } else {
-        let bound = params.iter().map(|generic_param| {
-            let type_param = match generic_param {
-                GenericParam::Type(type_param) => type_param.ident.to_string(),
-                _ => return quote! {},
-            };
-
-            let field_type = fields.iter().find_map(|field| {
-                if extract_type_arguments(&field.ty).contains(&type_param) {
-                    Some(&field.ty)
-                } else {
-                    None
-                }
-            });
-            match field_type {
-                Some(field_type) => quote! {
-                    #field_type : std::fmt::Debug,
-                },
-                None => quote! {
-                    #generic_param : std::fmt::Debug,
-                },
+    for param in &mut generics.params {
+        if let GenericParam::Type(ref mut type_param) = *param {
+            // 该泛型参数仅在phantom字段中使用
+            if phantom_types.contains(&type_param.ident.to_string())
+                && !field_type_names.contains(&type_param.ident.to_string())
+            {
+                continue;
             }
-        });
-
-        quote! { where #(#bound)*}
-    };
+            type_param.bounds.push(parse_quote!(std::fmt::Debug));
+        }
+    }
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     quote! {
-        impl #generics std::fmt::Debug for #name #generics #bound {
+        impl #impl_generics std::fmt::Debug for #name #ty_generics #where_clause  {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.debug_struct(stringify!(#name))
                     #(#fields_chain)*
